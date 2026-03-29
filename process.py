@@ -70,11 +70,11 @@ def parse_cover_markdown(md_text):
     Parse cover page markdown to extract:
       - student_name (string)
       - student_no (string)
-      - marks (dict): {"Q1": "20", "Q2 (1-3)": "3", ..., "Total": "40"}
+      - marks_str (string): space-separated marks earned, e.g. "20 3 3 7 7"
     """
     student_name = ""
     student_no = ""
-    marks = {}
+    marks_values = []
 
     # Extract student name (stop at "Student No" if on same line)
     m = re.search(r'Student\s+Name\s*[:\-]\s*(.+?)(?:\s*Student\s+No|$)', md_text, re.IGNORECASE)
@@ -99,7 +99,7 @@ def parse_cover_markdown(md_text):
                         student_no = ''.join(digits)
                         break
 
-    # Parse the examiners table – extract Q label and Marks Earned for each row
+    # Parse the examiners table – extract only the "Marks Earned" values
     lines = md_text.split('\n')
     in_table = False
 
@@ -124,12 +124,12 @@ def parse_cover_markdown(md_text):
             cells = [c.strip() for c in stripped.split('|')]
             cells = [c for c in cells if c != '']
             if len(cells) >= 3:
-                q_label = re.sub(r'<[^>]+>', '', cells[0]).strip()
                 marks_earned = re.sub(r'<[^>]+>', '', cells[2]).strip()
-                if q_label and marks_earned:
-                    marks[q_label] = marks_earned
+                if marks_earned:
+                    marks_values.append(marks_earned)
 
-    return student_name, student_no, marks
+    marks_str = " ".join(marks_values)
+    return student_name, student_no, marks_str
 
 
 # ── MCQ page parsing ─────────────────────────────────────────────────────────
@@ -140,6 +140,10 @@ def parse_mcq_markdown(md_text):
       - student_name (string)
       - student_no (string)
       - answers_str (space-separated capital letters, e.g. "A B C D A B ...")
+
+    Supports two table formats:
+      1. Answer column: | Question # | Answer |  with letter in Answer cell
+      2. X-grid:        | Question # | A | B | C | D |  with X marking the choice
     """
     student_name = ""
     student_no = ""
@@ -157,7 +161,6 @@ def parse_mcq_markdown(md_text):
 
     # If student_no is empty, look for digit table after "Student No:"
     if not student_no:
-        # Find text after "Student No:" and look for a row with only digit cells
         m = re.search(r'Student\s+No[:\.]?\s*[:\-]?\s*\n(.*)', md_text, re.IGNORECASE | re.DOTALL)
         if m:
             remaining = m.group(1)
@@ -172,22 +175,52 @@ def parse_mcq_markdown(md_text):
     # Parse answer table
     lines = md_text.split('\n')
     in_table = False
+    is_x_grid = False
+    choice_cols = []
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-        if 'Answer' in stripped and 'Question' in stripped:
-            in_table = True
-            continue
+
+        # Detect table header
+        if not in_table:
+            # Check for X-grid format: headers A B C D
+            if re.search(r'\|\s*Question\s*#?\s*\|\s*A\s*\|\s*B\s*\|', stripped, re.IGNORECASE):
+                in_table = True
+                is_x_grid = True
+                # Parse header to find which columns are A, B, C, D, E
+                header_cells = [c.strip().upper() for c in stripped.split('|')]
+                header_cells = [c for c in header_cells if c]
+                choice_cols = header_cells[1:]  # skip "Question #"
+                continue
+            # Check for Answer column format
+            if 'Answer' in stripped and 'Question' in stripped:
+                in_table = True
+                is_x_grid = False
+                continue
+
         if in_table:
             if re.match(r'^\|[\s\-\|]+\|$', stripped):
                 continue
             if not stripped.startswith('|'):
                 break
+
             cells = [c.strip() for c in stripped.split('|')]
-            cells = [c for c in cells if c != '']
-            if len(cells) >= 2:
+            # Remove first and last empty from leading/trailing |
+            if cells and cells[0] == '':
+                cells = cells[1:]
+            if cells and cells[-1] == '':
+                cells = cells[:-1]
+
+            if is_x_grid and len(cells) >= 2:
+                # X-grid: find which column has the X (check cells after question #)
+                for ci, col_name in enumerate(choice_cols):
+                    if ci + 1 < len(cells) and cells[ci + 1].strip().upper() in ('X', '✓', 'V'):
+                        answers.append(col_name)
+                        break
+            elif not is_x_grid and len(cells) >= 2:
+                # Answer column format
                 answer = cells[-1].strip().upper()
                 if answer in ('A', 'B', 'C', 'D', 'E'):
                     answers.append(answer)
@@ -235,106 +268,84 @@ def write_csv(filepath, header, rows):
 # ── Cover PDF processor ──────────────────────────────────────────────────────
 
 def process_cover_pdf(cover_pdf, cover_csv, api_key, output_dir):
-    """Extract pages from cover.pdf, OCR each, and inject grades into CoverPage.csv."""
+    """Extract first page from cover.pdf, OCR it, and inject grades into CoverPage.csv."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     header, rows = read_csv(cover_csv)
 
+    # Ensure "Marks Earned" column exists
+    if 'Marks Earned' not in header:
+        header.append('Marks Earned')
+        for row in rows:
+            row['Marks Earned'] = ''
+
     client = DatalabClient(api_key)
     options = ConvertOptions(output_format="markdown", mode="balanced", paginate=True)
 
-    page_count = get_pdf_page_count(cover_pdf)
-    print(f"Cover PDF: {page_count} pages", file=sys.stderr)
+    # Extract first page only
+    tmp_path = output_dir / "_cover_page_1.pdf"
+    extract_page(cover_pdf, 0, tmp_path)
 
-    matches = 0
-    all_q_columns = set()
+    # OCR
+    md = ocr_file(tmp_path, client, options)
 
-    for i in range(page_count):
-        # Extract page to temp file
-        tmp_path = output_dir / f"_cover_page_{i+1}.pdf"
-        extract_page(cover_pdf, i, tmp_path)
+    # Save OCR output for reference
+    md_out = output_dir / "cover_page_1.md"
+    with open(md_out, 'w', encoding='utf-8') as f:
+        f.write(md)
 
-        # OCR
-        md = ocr_file(tmp_path, client, options)
+    # Parse
+    student_name, student_no, marks_str = parse_cover_markdown(md)
+    print(f"  Page 1: {student_name} ({student_no}) -> marks: {marks_str}", file=sys.stderr)
 
-        # Save OCR output for reference
-        md_out = output_dir / f"cover_page_{i+1}.md"
-        with open(md_out, 'w', encoding='utf-8') as f:
-            f.write(md)
-
-        # Parse
-        student_name, student_no, marks = parse_cover_markdown(md)
-        print(f"  Page {i+1}: {student_name} ({student_no}) -> {marks}", file=sys.stderr)
-
-        if not student_name.strip():
-            print(f"    Skipped (no student name found)", file=sys.stderr)
-            tmp_path.unlink(missing_ok=True)
-            continue
-
-        # Track all question columns we need
-        for q in marks:
-            all_q_columns.add(q)
-
-        # Match and inject
-        idx = find_csv_row_by_name(rows, student_name)
-        if idx is not None:
-            for q, val in marks.items():
-                rows[idx][q] = val
-            matches += 1
-            print(f"    Matched CSV row {idx}: {rows[idx]['Student Name']}", file=sys.stderr)
-        else:
-            new_row = {h: '' for h in header}
-            new_row['Student ID'] = student_no
-            new_row['Student Name'] = student_name
-            for q, val in marks.items():
-                new_row[q] = val
-            rows.append(new_row)
-            matches += 1
-            print(f"    Created new row: {student_name} ({student_no})", file=sys.stderr)
-
-        # Clean up temp file
+    if not student_name.strip():
+        print(f"    Skipped (no student name found)", file=sys.stderr)
         tmp_path.unlink(missing_ok=True)
+        write_csv(cover_csv, header, rows)
+        return
 
-    # Add any new question columns to the header (before Total if it exists)
-    existing_cols = set(header)
-    new_cols = sorted(all_q_columns - existing_cols - {'Total'})
-    total_col = ['Total'] if 'Total' in all_q_columns and 'Total' not in existing_cols else []
-    if new_cols or total_col:
-        # Insert new question columns after Student Name, Total at the end
-        insert_pos = 2  # after Student ID, Student Name
-        for col in new_cols:
-            header.insert(insert_pos, col)
-            insert_pos += 1
-        for col in total_col:
-            header.append(col)
-        # Fill missing columns in all rows
-        for row in rows:
-            for col in new_cols + total_col:
-                if col not in row:
-                    row[col] = ''
+    # Match and inject
+    idx = find_csv_row_by_name(rows, student_name)
+    if idx is not None:
+        rows[idx]['Marks Earned'] = marks_str
+        print(f"    Matched CSV row {idx}: {rows[idx]['Student Name']}", file=sys.stderr)
+    else:
+        new_row = {h: '' for h in header}
+        new_row['Student ID'] = student_no
+        new_row['Student Name'] = student_name
+        new_row['Marks Earned'] = marks_str
+        rows.append(new_row)
+        print(f"    Created new row: {student_name} ({student_no})", file=sys.stderr)
+
+    # Clean up temp file
+    tmp_path.unlink(missing_ok=True)
 
     # Write updated CSV
     write_csv(cover_csv, header, rows)
-    print(f"\nCover: {matches}/{page_count} students processed. CSV updated: {cover_csv}", file=sys.stderr)
+    print(f"\nCover: CSV updated: {cover_csv}", file=sys.stderr)
 
 
 # ── MCQ PDF processor ────────────────────────────────────────────────────────
 
 def process_mcq_pdf(mcq_pdf, mcq_csv, api_key, output_dir):
-    """OCR mcq3.pdf and inject MCQ answers into mcq.csv."""
+    """OCR mcq PDF and inject MCQ answers into mcq.csv."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     header, rows = read_csv(mcq_csv)
+
+    # Ensure "Answers" column exists
+    if 'Answers' not in header:
+        header.append('Answers')
+        for row in rows:
+            row['Answers'] = ''
 
     client = DatalabClient(api_key)
     options = ConvertOptions(output_format="markdown", mode="balanced", paginate=True)
 
     page_count = get_pdf_page_count(mcq_pdf)
     print(f"MCQ PDF: {page_count} pages", file=sys.stderr)
-
-    matches = 0
 
     for i in range(page_count):
         # Extract page to temp file
@@ -358,26 +369,17 @@ def process_mcq_pdf(mcq_pdf, mcq_csv, api_key, output_dir):
             tmp_path.unlink(missing_ok=True)
             continue
 
-        # Split answers into Q1-10 and Q11-20
-        all_answers = answers_str.split()
-        q1_10 = " ".join(all_answers[:10]) if len(all_answers) >= 10 else " ".join(all_answers[:len(all_answers)])
-        q11_20 = " ".join(all_answers[10:20]) if len(all_answers) > 10 else ""
-
         # Match and inject
         idx = find_csv_row_by_name(rows, student_name)
         if idx is not None:
-            rows[idx]['Q1 - 10'] = q1_10
-            rows[idx]['Q2 - 20'] = q11_20
-            matches += 1
+            rows[idx]['Answers'] = answers_str
             print(f"    Matched CSV row {idx}: {rows[idx]['Student Name']}", file=sys.stderr)
         else:
             new_row = {h: '' for h in header}
             new_row['Student ID'] = student_no
             new_row['Student Name'] = student_name
-            new_row['Q1 - 10'] = q1_10
-            new_row['Q2 - 20'] = q11_20
+            new_row['Answers'] = answers_str
             rows.append(new_row)
-            matches += 1
             print(f"    Created new row: {student_name} ({student_no})", file=sys.stderr)
 
         # Clean up temp file
@@ -385,7 +387,7 @@ def process_mcq_pdf(mcq_pdf, mcq_csv, api_key, output_dir):
 
     # Write updated CSV
     write_csv(mcq_csv, header, rows)
-    print(f"\nMCQ: {matches}/{page_count} students processed. CSV updated: {mcq_csv}", file=sys.stderr)
+    print(f"\nMCQ: CSV updated: {mcq_csv}", file=sys.stderr)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -396,14 +398,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process both cover and MCQ PDFs
+  # Process a single cover PDF and a single MCQ PDF
   python process.py --cover cover.pdf --cover-csv CoverPage.csv --mcq mcq3.pdf --mcq-csv mcq.csv
 
-  # Process only the cover PDF
-  python process.py --cover cover.pdf --cover-csv CoverPage.csv
+  # Process a folder of cover PDFs
+  python process.py --cover cover_folder/ --cover-csv CoverPage.csv
 
-  # Process only the MCQ PDF
-  python process.py --mcq mcq3.pdf --mcq-csv mcq.csv
+  # Process a folder of MCQ PDFs
+  python process.py --mcq mcq_folder/ --mcq-csv mcq.csv
+
+  # Process folders of both
+  python process.py --cover cover_folder/ --cover-csv CoverPage.csv --mcq mcq_folder/ --mcq-csv mcq.csv
 
   # Specify API key directly
   python process.py --cover cover.pdf --cover-csv CoverPage.csv --api-key YOUR_KEY
@@ -427,15 +432,37 @@ Examples:
 
     if args.cover:
         print("=" * 60, file=sys.stderr)
-        print("Processing Cover PDF", file=sys.stderr)
+        print("Processing Cover PDF(s)", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
-        process_cover_pdf(args.cover, args.cover_csv, api_key, output_dir)
+        cover_path = Path(args.cover)
+        if cover_path.is_dir():
+            pdf_files = sorted(cover_path.glob("*.pdf"))
+            if not pdf_files:
+                print(f"No PDF files found in {cover_path}", file=sys.stderr)
+            else:
+                print(f"Found {len(pdf_files)} PDF(s) in {cover_path}", file=sys.stderr)
+                for pdf in pdf_files:
+                    print(f"\n--- Processing: {pdf.name} ---", file=sys.stderr)
+                    process_cover_pdf(str(pdf), args.cover_csv, api_key, output_dir)
+        else:
+            process_cover_pdf(args.cover, args.cover_csv, api_key, output_dir)
 
     if args.mcq:
         print("\n" + "=" * 60, file=sys.stderr)
-        print("Processing MCQ PDF", file=sys.stderr)
+        print("Processing MCQ PDF(s)", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
-        process_mcq_pdf(args.mcq, args.mcq_csv, api_key, output_dir)
+        mcq_path = Path(args.mcq)
+        if mcq_path.is_dir():
+            pdf_files = sorted(mcq_path.glob("*.pdf"))
+            if not pdf_files:
+                print(f"No PDF files found in {mcq_path}", file=sys.stderr)
+            else:
+                print(f"Found {len(pdf_files)} PDF(s) in {mcq_path}", file=sys.stderr)
+                for pdf in pdf_files:
+                    print(f"\n--- Processing: {pdf.name} ---", file=sys.stderr)
+                    process_mcq_pdf(str(pdf), args.mcq_csv, api_key, output_dir)
+        else:
+            process_mcq_pdf(args.mcq, args.mcq_csv, api_key, output_dir)
 
     print("\nDone.", file=sys.stderr)
 
