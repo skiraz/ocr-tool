@@ -207,6 +207,66 @@ optional:
 
 ---
 
+## API Server (`server.py`)
+
+A FastAPI server that provides two endpoints for processing PDFs via HTTP requests. Returns JSON responses.
+
+### Start the server
+
+```bash
+cd ocr-tool
+py -3.10 server.py
+```
+
+The server runs on `http://localhost:8000`.
+
+### Interactive docs
+
+- **`http://localhost:8000/`** — Simple upload test page
+- **`http://localhost:8000/docs`** — Swagger UI with full API documentation
+
+### `POST /mcq`
+
+Upload one or more MCQ PDF files. Returns a JSON array with each student's answers.
+
+**Request:** `multipart/form-data` with one or more `files` fields.
+
+**Response:**
+```json
+[
+    {"id": "20180321", "name": "Ali Ahmad", "answers": "A B B B A A B D D C B C B D C B C A A A"},
+    {"id": "20223271", "name": "Farah Mustafa", "answers": "C C D A A B B D C C D D A B A A B B C A"}
+]
+```
+
+### `POST /cover`
+
+Upload one or more cover page PDF files. Returns a JSON array with each student's marks. Only the first page of each PDF is processed.
+
+**Request:** `multipart/form-data` with one or more `files` fields.
+
+**Response:**
+```json
+[
+    {"id": "20221084", "name": "Lori Ketchjian", "grades": "20 3 3 7 7 40"}
+]
+```
+
+### Test files
+
+Sample test files are located in `ocr-tool/test/`:
+- `test/mcq/` — MCQ PDFs (answer column and X-grid formats)
+- `test/cover/` — Cover page PDFs
+
+### Error responses
+
+All endpoints return errors as JSON:
+```json
+{"error": "description of what went wrong"}
+```
+
+---
+
 ## Supported File Types
 
 - PDF (`.pdf`)
@@ -241,10 +301,15 @@ WantedBy=multi-user.target
 ocr-tool/
   api.py             Raw OCR conversion script
   process.py         Exam PDF processor (cover + MCQ -> CSV injection)
+  server.py          FastAPI server with /mcq and /cover endpoints
   requirements.txt   Python dependencies
   .env.example       Example environment config
+  .env               API key config (not in repo)
   .gitignore         Git ignore rules
   run.sh             Linux/macOS run script
   run.bat            Windows run script
+  test/
+    mcq/             Sample MCQ PDFs for testing
+    cover/           Sample cover PDFs for testing
   README.md          This file
 ```
